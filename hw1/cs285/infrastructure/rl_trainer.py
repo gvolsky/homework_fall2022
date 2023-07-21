@@ -5,6 +5,8 @@ import time
 import gym
 import torch
 
+from tqdm import tqdm
+
 from cs285.infrastructure import pytorch_util as ptu
 from cs285.infrastructure.logger import Logger
 from cs285.infrastructure import utils
@@ -130,7 +132,7 @@ class RL_Trainer(object):
                 # perform logging
                 print('\nBeginning logging procedure...')
                 self.perform_logging(
-                    itr, paths, eval_policy, train_video_paths, training_logs)
+                    itr, paths, eval_policy, expert_policy, train_video_paths, training_logs)
 
                 if self.params['save_params']:
                     print('\nSaving agent params')
@@ -163,13 +165,16 @@ class RL_Trainer(object):
                 # ``` return loaded_paths, 0, None ```
 
                 # (2) collect `self.params['batch_size']` transitions
+        if itr == 0 and load_initial_expertdata is not None:
+            return np.load(load_initial_expertdata, allow_pickle=True), 0, None
 
         # TODO collect `batch_size` samples to be used for training
         # HINT1: use sample_trajectories from utils
         # HINT2: you want each of these collected rollouts to be of length self.params['ep_len']
         print("\nCollecting data to be used for training...")
-        paths, envsteps_this_batch = TODO
-
+        paths, envsteps_this_batch = utils.sample_trajectories(
+            env=self.env, policy=collect_policy, min_timesteps_per_batch=batch_size, max_path_length=self.params['ep_len']
+        )
         # collect more rollouts with the same policy, to be saved as videos in tensorboard
         # note: here, we collect MAX_NVIDEO rollouts, each of length MAX_VIDEO_LEN
         train_video_paths = None
@@ -184,17 +189,17 @@ class RL_Trainer(object):
     def train_agent(self):
         print('\nTraining agent using sampled data from replay buffer...')
         all_logs = []
-        for train_step in range(self.params['num_agent_train_steps_per_iter']):
+        for train_step in tqdm(range(self.params['num_agent_train_steps_per_iter'])):
 
             # TODO sample some data from the data buffer
             # HINT1: use the agent's sample function
             # HINT2: how much data = self.params['train_batch_size']
-            ob_batch, ac_batch, re_batch, next_ob_batch, terminal_batch = TODO
+            ob_batch, ac_batch, re_batch, next_ob_batch, terminal_batch = self.agent.sample(self.params['train_batch_size'])
 
             # TODO use the sampled data to train an agent
             # HINT: use the agent's train function
             # HINT: keep the agent's training log for debugging
-            train_log = TODO
+            train_log = self.agent.train(ob_batch, ac_batch, re_batch, next_ob_batch, terminal_batch)
             all_logs.append(train_log)
         return all_logs
 
@@ -204,17 +209,29 @@ class RL_Trainer(object):
         # TODO relabel collected obsevations (from our policy) with labels from an expert policy
         # HINT: query the policy (using the get_action function) with paths[i]["observation"]
         # and replace paths[i]["action"] with these expert labels
+        for i in range(len(paths)):
+            paths[i]["action"] = expert_policy.get_action(paths[i]["observation"])
 
         return paths
 
     ####################################
     ####################################
 
-    def perform_logging(self, itr, paths, eval_policy, train_video_paths, training_logs):
+    def perform_logging(self, itr, paths, eval_policy, expert_policy, train_video_paths, training_logs):
 
-        # collect eval trajectories, for logging
-        print("\nCollecting data for eval...")
+        # collect eval and expert trajectories, for logging
+        print("\nCollecting data for eval and expert...")
         eval_paths, eval_envsteps_this_batch = utils.sample_trajectories(self.env, eval_policy, self.params['eval_batch_size'], self.params['ep_len'])
+        if not hasattr(self, "expert_stats"):
+            expert_aggregate = {"returns": [], "ep_lens": []}
+            for _ in tqdm(range(10)):
+                expert_paths, _ = utils.sample_trajectories(self.env, expert_policy, self.params['eval_batch_size'], self.params['ep_len'])
+                expert_aggregate["returns"].extend([expert_path["reward"].sum() for expert_path in expert_paths])
+                expert_aggregate["ep_lens"].extend([len(expert_path["reward"]) for expert_path in expert_paths])
+            self.expert_stats = {
+                "returns": np.mean(expert_aggregate["returns"]),
+                "ep_lens": np.mean(expert_aggregate["ep_lens"])
+                }
 
         # save eval rollouts as videos in tensorboard event file
         if self.log_video and train_video_paths != None:
@@ -233,18 +250,26 @@ class RL_Trainer(object):
             # returns, for logging
             train_returns = [path["reward"].sum() for path in paths]
             eval_returns = [eval_path["reward"].sum() for eval_path in eval_paths]
+            # expert_returns = [expert_path["reward"].sum() for expert_path in expert_paths]
 
             # episode lengths, for logging
             train_ep_lens = [len(path["reward"]) for path in paths]
             eval_ep_lens = [len(eval_path["reward"]) for eval_path in eval_paths]
+            # expert_ep_lens = [len(expert_path["reward"]) for expert_path in expert_paths]
 
             # decide what to log
             logs = OrderedDict()
-            logs["Eval_AverageReturn"] = np.mean(eval_returns)
+            eval_avg_return = np.mean(eval_returns)
+            # expert_avg_return = np.mean(expert_returns)
+            logs["Eval_AverageReturn"] = eval_avg_return
             logs["Eval_StdReturn"] = np.std(eval_returns)
             logs["Eval_MaxReturn"] = np.max(eval_returns)
             logs["Eval_MinReturn"] = np.min(eval_returns)
             logs["Eval_AverageEpLen"] = np.mean(eval_ep_lens)
+
+            logs["Expert_AverageReturn"] = self.expert_stats["returns"]
+            logs["Expert_AverageEpLen"] = self.expert_stats["ep_lens"]
+            logs["Agent_VS_Expert"] = eval_avg_return / self.expert_stats["returns"]
 
             logs["Train_AverageReturn"] = np.mean(train_returns)
             logs["Train_StdReturn"] = np.std(train_returns)
